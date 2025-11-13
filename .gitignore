@@ -1,2 +1,8 @@
 .venv/
 __pycache__/
+assets/
+checkpoints/
+outputs/
+src/
+requirements-mvp.txt
+MVP_REIMPLEMENTATION.md
