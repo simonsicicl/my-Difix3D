@@ -6,3 +6,5 @@ outputs/
 src/
 requirements-mvp.txt
 MVP_REIMPLEMENTATION.md
+nerf_llff_data/
+data/

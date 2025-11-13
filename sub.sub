@@ -1,0 +1,10 @@
+#!/bin/bash
+
+module load cuda
+module load conda
+
+source .venv/bin/activate
+
+python train_mvp.py --data-root data/fern --steps 50 --enable-defects \
+  --defects mask,noise,blur,jpeg,occlusion,color \
+  --defect-prob 0.7 --defect-strength 1.0
