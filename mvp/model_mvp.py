@@ -289,14 +289,36 @@ class MVPSDTurbo(nn.Module):
         B, V, C, H, W = images.shape
         assert C == 3
 
-        # Encode text prompt/tokens
+        # Encode text prompt/tokens; ensure batch size B alignment
         if (prompt is None) and (prompt_tokens is None):
             prompt = "a photo"
         if prompt is not None:
-            input_ids = self.tokenizer(prompt, max_length=self.tokenizer.model_max_length,
-                                       padding="max_length", truncation=True, return_tensors="pt").input_ids.to(device)
+            # Accept str or list; if str, repeat across batch
+            if isinstance(prompt, str):
+                prompts = [prompt] * B
+            else:
+                prompts = list(prompt)
+                if len(prompts) != B:
+                    # pad or truncate to match B
+                    if len(prompts) < B:
+                        prompts = (prompts + [prompts[-1]] * (B - len(prompts)))[:B]
+                    else:
+                        prompts = prompts[:B]
+            toks = self.tokenizer(
+                prompts,
+                max_length=self.tokenizer.model_max_length,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+            input_ids = toks.input_ids.to(device)
         else:
             input_ids = prompt_tokens.to(device)
+            # If provided tokens don't match batch, tile to B
+            if input_ids.shape[0] != B:
+                input_ids = repeat(input_ids, 'b n -> (b r) n', r=(B // input_ids.shape[0]))
+                # In case B isn't multiple, slice
+                input_ids = input_ids[:B]
         with torch.no_grad():
             caption_enc = self.text_encoder(input_ids)[0]  # (B,N,C)
 
@@ -305,7 +327,7 @@ class MVPSDTurbo(nn.Module):
         x = x * 2 - 1
         z = self.vae.encode(x).latent_dist.sample() * self.scaling_factor  # ((B*V),4,h,w)
 
-        # Repeat caption encodings across views
+        # Repeat caption encodings across views to match flattened (B*V)
         caption_enc = repeat(caption_enc, 'b n c -> (b v) n c', v=V)
 
         # UNet predict and one-step denoise

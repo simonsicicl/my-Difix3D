@@ -1,8 +1,8 @@
-"""Inference script (SD-Turbo only, single-step latent denoising).
+"""Inference script (SD-Turbo, paired JSON only).
 
 Usage example:
     python inference_mvp.py --sd-turbo-id stabilityai/sd-turbo \
-            --data-root example_scene --ckpt checkpoints/mvp_sd_turbo_step_0100.pt --target-index 0 --sigma-latent 0.3
+            --paired-json fern_paired.json --ckpt checkpoints/mvp_sd_turbo_step_0100.pt
 """
 import argparse
 import os
@@ -11,14 +11,14 @@ import torch
 import torchvision.transforms as T
 
 from mvp.model_mvp import MVPSDTurbo
-from mvp.dataset_mvp import MVPSceneDataset
+from mvp.dataset_mvp import MVPPairedDataset
 
 def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Inference DIFIX3D MVP (SD-Turbo)")
+    p = argparse.ArgumentParser(description="Inference DIFIX3D MVP (SD-Turbo, paired JSON only)")
     p.add_argument("--sd-turbo-id", type=str, default="stabilityai/sd-turbo")
-    p.add_argument("--data-root", type=str, required=True)
+    p.add_argument("--paired-json", type=str, required=True, help="Paired dataset JSON path")
+    p.add_argument("--sample-id", type=str, default=None, help="Sample key inside paired JSON (default: first entry)")
     p.add_argument("--ckpt", type=str, required=False, help="Checkpoint path (optional for sd-turbo frozen)")
-    p.add_argument("--target-index", type=int, default=0, help="Target view index to reconstruct")
     p.add_argument("--sigma-latent", type=float, default=0.3, help="(unused) kept for CLI parity")
     p.add_argument("--out", type=str, default="outputs/infer.png")
     p.add_argument("--device", type=str, default="cuda")
@@ -39,15 +39,12 @@ def save_image(t: torch.Tensor, path: str | Path):
     img.save(path)
 
 def run_sd_turbo(args):
-    ds = MVPSceneDataset(args.data_root)
-    item = ds[0]
-    images = item["images"].unsqueeze(0).to(args.device)
-    poses = item["poses"].unsqueeze(0).to(args.device)  # adapt shape (B,V,4,4)
-    # Validate target index against available views
-    V = images.shape[1]
-    if not (0 <= args.target_index < V):
-        raise IndexError(f"target_index {args.target_index} is out of bounds for available views (0..{V-1}).\n"
-                         f"Hint: example_scene currently has {V} views. Pick a target index in [0,{V-1}].")
+    ds = MVPPairedDataset(args.paired_json, split='test', image_size=0)
+    key = ds.keys[0] if args.sample_id is None else args.sample_id
+    idx = ds.keys.index(key)
+    batch = ds[idx]
+    images = batch['conditioning_pixel_values'].unsqueeze(0).to(args.device)
+    poses = torch.eye(4, device=args.device).view(1,1,4,4).repeat(images.shape[0], images.shape[1],1,1)
     model = MVPSDTurbo(
         sd_turbo_id=args.sd_turbo_id,
         device=args.device,
@@ -68,8 +65,8 @@ def run_sd_turbo(args):
     with torch.no_grad():
         out = model(images, poses, prompt=args.prompt)  # (B,V,3,H,W) in [-1,1]
     ensure_dir(args.out)
-    # Select target view and save in [0,1]
-    target = out[:, args.target_index]
+    # Paired mode: primary slice 0 is the corrupted view we reconstruct
+    target = out[:, 0]
     target = ((target + 1) / 2).clamp(0, 1)
     save_image(target, args.out)
     print("Saved sd-turbo inference to", args.out)
