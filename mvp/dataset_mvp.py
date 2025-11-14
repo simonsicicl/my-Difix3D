@@ -20,17 +20,23 @@ class MVPSceneDataset(Dataset):
     """Single-scene dataset returning all views at once.
 
     Returns a single sample at index 0 with keys:
-      - images: Tensor(V, 3, S, S) in [0,1]
+      - images: Tensor(V, 3, H, W) in [0,1] (H=W=final_size if resizing enabled)
       - poses:  Tensor(V, 4, 4)
+    If image_size <= 0 and no downscale provided, original image resolution is preserved.
     """
 
     def __init__(self, data_root: str, image_size: int = 256, downscale: int | None = None):
         self.data_root = str(Path(data_root).resolve())
         self.image_size = int(image_size)
         self.downscale = int(downscale) if downscale is not None else None
-        self.final_size = self.downscale if self.downscale is not None else self.image_size
-        assert self.final_size > 0, "image_size/downscale must be positive"
-        
+        # Determine final size: if downscale provided use it; else if image_size > 0 use it; else keep original
+        if self.downscale is not None:
+            self.final_size = self.downscale
+        elif self.image_size > 0:
+            self.final_size = self.image_size
+        else:
+            self.final_size = 0  # sentinel meaning: no resizing
+
         # Load file lists
         self.image_paths = sorted_image_paths(self.data_root)
         self.poses = load_poses_json(self.data_root)
@@ -39,12 +45,15 @@ class MVPSceneDataset(Dataset):
         assert V_img == V_pose, f"Number of images ({V_img}) != number of poses ({V_pose})"
         if V_img < 2:
             warnings.warn("Less than 2 views; results may be poor.")
-        
-        # Preload and resize images into a tensor (V,3,S,S)
-        tfm = T.Compose([
-            T.Resize((self.final_size, self.final_size), interpolation=T.InterpolationMode.BILINEAR),
-            T.ToTensor(),
-        ])
+
+        # Preload images into a tensor
+        if self.final_size > 0:
+            tfm = T.Compose([
+                T.Resize((self.final_size, self.final_size), interpolation=T.InterpolationMode.BILINEAR),
+                T.ToTensor(),
+            ])
+        else:
+            tfm = T.ToTensor()
         images = []
         for p in self.image_paths:
             with Image.open(p) as im:
@@ -57,4 +66,4 @@ class MVPSceneDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         assert idx == 0, "MVPSceneDataset only contains a single scene (index 0)."
-        return {"images": self.images, "poses": self.poses}
+        return {"images": self.images, "poses": self.poses, "final_size": self.final_size}

@@ -1,10 +1,12 @@
 #!/bin/bash
 
 module load cuda
-module load conda
+# module load conda
 
-source .venv/bin/activate
+source /scratch/scholar/chou170/.venv/bin/activate
 
-python train_mvp.py --data-root data/fern --steps 50 --enable-defects \
-  --defects mask,noise,blur,jpeg,occlusion,color \
-  --defect-prob 0.7 --defect-strength 1.0
+python train_mvp.py --data-root data/fern --steps 100   \
+  --enable-defects --defects mask,noise,blur,jpeg,occlusion,color   \
+  --defect-prob 0.7 --defect-strength 1.0   --freeze-unet \
+  --only-target-forward --enable-vae-tiling --precision fp16   \
+  --image-size 0 --enable-xformers

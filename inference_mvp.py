@@ -24,6 +24,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--prompt", type=str, default="a photo", help="Text prompt")
     p.add_argument("--lora-rank-vae", type=int, default=4, help="LoRA rank for VAE decoder (should match training)")
+    p.add_argument("--enable-xformers", action="store_true", help="Use xFormers memory-efficient attention if available")
     return p
 
 
@@ -51,7 +52,14 @@ def run_sd_turbo(args):
         sd_turbo_id=args.sd_turbo_id,
         device=args.device,
         lora_rank_vae=args.lora_rank_vae,
+        enable_xformers=args.enable_xformers,
     ).to(args.device)
+    if args.enable_xformers:
+        try:
+            backend = model.get_attention_backend()
+            print(f"[SD-Turbo] Attention backend (inference): {backend}")
+        except Exception:
+            pass
     if args.ckpt and os.path.isfile(args.ckpt):
         state = torch.load(args.ckpt, map_location=args.device)
         missing, unexpected = model.load_state_dict(state, strict=False)

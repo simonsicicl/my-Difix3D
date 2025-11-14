@@ -7,10 +7,12 @@ been removed per the project direction.
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler
 from einops import rearrange, repeat
 from peft import LoraConfig
 from transformers import AutoTokenizer, CLIPTextModel
+from typing import Optional
 
 class MVPSDTurbo(nn.Module):
     """SD-Turbo based single-step latent reconstruction with multi-view conditioning.
@@ -36,6 +38,7 @@ class MVPSDTurbo(nn.Module):
         lora_rank_vae: int = 4,
         device: str | torch.device = "cuda",
         timestep: int = 999,
+        enable_xformers: bool | None = None,
     ):
         super().__init__()
         self.sd_turbo_id = sd_turbo_id
@@ -58,6 +61,13 @@ class MVPSDTurbo(nn.Module):
         self.sched.alphas_cumprod = self.sched.alphas_cumprod.to(device)
         self.timesteps = torch.tensor([timestep], device=device, dtype=torch.long)
 
+        # Optionally enable memory-efficient attention via xFormers when requested
+        if enable_xformers:
+            try:
+                self.enable_xformers()
+            except Exception:
+                pass
+
     def set_eval(self):
         self.unet.eval()
         self.vae.eval()
@@ -75,6 +85,50 @@ class MVPSDTurbo(nn.Module):
             for name in ['skip_conv_1','skip_conv_2','skip_conv_3','skip_conv_4']:
                 if hasattr(self.vae.decoder, name):
                     getattr(self.vae.decoder, name).requires_grad_(True)
+
+    def enable_xformers(self) -> bool:
+        """Enable xFormers memory-efficient attention on UNet if available.
+
+        Returns True on success, False otherwise.
+        """
+        try:
+            self.unet.enable_xformers_memory_efficient_attention()
+            return True
+        except Exception:
+            return False
+
+    def get_attention_backend(self) -> str:
+        """Best-effort inspection of current attention backend used by UNet.
+
+        Returns one of {"xformers", "sdpa", "default"}.
+        """
+        # diffusers>=0.14 exposes attn_processors mapping
+        try:
+            from diffusers.models.attention_processor import (
+                XFormersAttnProcessor,
+                AttnProcessor2_0,
+                AttnProcessor,
+            )
+            procs = getattr(self.unet, "attn_processors", None)
+            if isinstance(procs, dict) and procs:
+                any_xf = any(isinstance(p, XFormersAttnProcessor) for p in procs.values())
+                if any_xf:
+                    return "xformers"
+                any_sdp = any(isinstance(p, AttnProcessor2_0) for p in procs.values())
+                if any_sdp:
+                    return "sdpa"
+                any_def = any(isinstance(p, AttnProcessor) for p in procs.values())
+                if any_def:
+                    return "default"
+        except Exception:
+            pass
+        # Fallback heuristic
+        try:
+            # If xformers is importable and was requested earlier, assume active
+            import xformers  # noqa: F401
+            return "xformers?"
+        except Exception:
+            return "unknown"
 
     def _setup_vae_skip_and_lora(self, lora_rank_vae: int = 4):
         """Add lightweight trainable components to VAE decoder:
@@ -119,6 +173,9 @@ class MVPSDTurbo(nn.Module):
                 if incoming is not None:
                     for idx, up_block in enumerate(self_dec.up_blocks):
                         skip_in = skip_convs[idx](incoming[::-1][idx] * self_dec.gamma)
+                        # If spatial shapes differ (e.g., VAE tiling or odd sizes), resize skip to match
+                        if skip_in.shape[-2:] != sample.shape[-2:]:
+                            skip_in = F.interpolate(skip_in, size=sample.shape[-2:], mode='bilinear', align_corners=False)
                         sample = sample + skip_in
                         sample = up_block(sample, latent_embeds)
                 else:
@@ -191,6 +248,11 @@ class MVPSDTurbo(nn.Module):
         # If skip is enabled, pass encoder activations to decoder before decode()
         if hasattr(self.vae.encoder, 'current_down_blocks'):
             self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
+        # Disable skip injection when VAE tiling is active to avoid shape mismatches
+        if getattr(self.vae, 'use_tiling', False):
+            self.vae.decoder.ignore_skip = True
+        else:
+            self.vae.decoder.ignore_skip = False
         if z.dim() == 5:
             B, V, C, H, W = z.shape
             zf = rearrange(z, 'b v c h w -> (b v) c h w')
@@ -253,6 +315,11 @@ class MVPSDTurbo(nn.Module):
         # Skip-connection assisted decode if activations are cached
         if hasattr(self.vae.encoder, 'current_down_blocks'):
             self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
+        # Disable skip injection when VAE tiling is active to avoid shape mismatches
+        if getattr(self.vae, 'use_tiling', False):
+            self.vae.decoder.ignore_skip = True
+        else:
+            self.vae.decoder.ignore_skip = False
         output_image = (self.vae.decode(z_denoised / self.scaling_factor).sample).clamp(-1, 1)
         output_image = rearrange(output_image, '(b v) c h w -> b v c h w', v=V)
         return output_image

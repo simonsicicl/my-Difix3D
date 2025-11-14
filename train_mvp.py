@@ -8,6 +8,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 import torchvision.utils as vutils
+from torch.amp import autocast, GradScaler
 
 from mvp.model_mvp import MVPSDTurbo
 from mvp.dataset_mvp import MVPSceneDataset
@@ -31,12 +32,18 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--freeze-unet", action="store_true", help="Freeze UNet to save memory (recommended initially)")
     p.add_argument("--enable-ckpt", action="store_true", help="Enable gradient checkpointing for UNet")
     p.add_argument("--enable-vae-tiling", action="store_true", help="Enable VAE tiling+slicing to reduce memory")
+    p.add_argument("--only-target-forward", action="store_true", help="Forward only the target view through UNet to reduce memory")
     # Defect synthesis options
     p.add_argument("--enable-defects", action="store_true", help="Train with corrupted inputs (DIFIX-style)")
     p.add_argument("--defects", type=str, default="mask,noise,blur,jpeg,occlusion,color",
                    help="Comma-separated defect kinds to apply to inputs")
     p.add_argument("--defect-prob", type=float, default=0.7, help="Per-op probability for applying a defect")
     p.add_argument("--defect-strength", type=float, default=1.0, help="Overall strength scaling for defects [0-1]")
+    # Precision / attention
+    p.add_argument("--precision", type=str, default="bf16", choices=["fp32","fp16","bf16"],
+                   help="Training precision (mixed precision recommended)")
+    p.add_argument("--enable-xformers", action="store_true", help="Use xFormers memory-efficient attention if available")
+    p.add_argument("--save-corrupt", action="store_true", help="Save corrupted target view image each step to outputs/")
     return p
 
 def ensure_dir(path: str | Path):
@@ -76,11 +83,25 @@ def train_sd_turbo(args):
             print("[SD-Turbo] Enabled VAE slicing+tiling")
         except Exception:
             pass
+    if args.enable_xformers:
+        ok = False
+        try:
+            ok = model.enable_xformers()
+        except Exception as e:
+            ok = False
+            print(f"[SD-Turbo] xFormers not enabled: {e}")
+        backend = model.get_attention_backend()
+        print(f"[SD-Turbo] Attention backend: {backend}{' (xformers active)' if ok else ''}")
 
     # Gather trainable params AFTER freezing policy applied
     params = [p for p in model.parameters() if p.requires_grad]
     print(f"[SD-Turbo] Trainable params: {sum(p.numel() for p in params)/1e6:.2f}M")
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.01)
+    # AMP setup
+    use_amp = args.precision in ("fp16","bf16") and torch.cuda.is_available()
+    amp_dtype = (torch.float16 if args.precision == "fp16" else
+                 torch.bfloat16 if args.precision == "bf16" else None)
+    scaler = GradScaler("cuda", enabled=(args.precision == "fp16"))
     V = images.shape[1]
     defect_kinds = [s.strip() for s in args.defects.split(',') if s.strip()]
     for step in range(1, args.steps + 1):
@@ -90,17 +111,33 @@ def train_sd_turbo(args):
         in_imgs = images
         if args.enable_defects:
             in_imgs = corrupt_batch(in_imgs, kinds=defect_kinds, prob=args.defect_prob, strength=args.defect_strength)
-        # Forward now returns reconstructed images in [-1,1] with shape (B,V,3,H,W)
-        out_imgs = model(in_imgs, poses, prompt=args.prompt)
-        # Prepare GT in the same range [-1,1]
-        gt_imgs = gt_imgs * 2 - 1
-        # Train on the selected target view to mirror prior behavior
-        pred = out_imgs[:, target_index]
-        gt = gt_imgs[:, target_index]
-        loss = F.mse_loss(pred, gt)
+            if args.save_corrupt:
+                ensure_dir("outputs")
+                # Save corrupted target view (still in [0,1])
+                corrupt_view = in_imgs[:, target_index].detach().cpu()
+                vutils.save_image(corrupt_view, f"outputs/corrupt_step_{step:04d}.png")
+        # Forward with autocast; output is in [-1,1]
         opt.zero_grad()
-        loss.backward()
-        opt.step()
+        with autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+            if args.only_target_forward:
+                in_sel = in_imgs[:, target_index:target_index+1]
+                poses_sel = poses[:, target_index:target_index+1]
+                out_imgs = model(in_sel, poses_sel, prompt=args.prompt)
+                pred = out_imgs[:, 0]
+            else:
+                out_imgs = model(in_imgs, poses, prompt=args.prompt)
+                pred = out_imgs[:, target_index]
+            gt_imgs_mp = gt_imgs * 2 - 1
+            gt = gt_imgs_mp[:, target_index]
+            loss = F.mse_loss(pred, gt)
+
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+        else:
+            loss.backward()
+            opt.step()
         if step % 10 == 0:
             print(f"[SD-Turbo] step={step} loss={loss.item():.4f} target_index={target_index}")
         if step % args.save_every == 0:
